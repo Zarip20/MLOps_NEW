@@ -240,6 +240,7 @@ jobs:
     # или доступ закрыт, обучение и все артефакты остаются в силе.
     continue-on-error: true
     permissions:
+      contents: read
       pages: write
       id-token: write
     environment:
@@ -247,11 +248,48 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
+      # Pages — настройка репозитория, а не файла в нём. Если она не
+      # сделана, `configure-pages` падает с «Get Pages site failed: Not
+      # Found», и это читается как ошибка проекта, хотя проект тут ни при
+      # чём. Поэтому сначала проверка и понятное предупреждение: job
+      # останется зелёным, а дашборд в любом случае лежит в артефактах
+      # `site` и `metadata-and-dashboard`.
+      - name: Проверить, включены ли Pages
+        id: pages_enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh api "repos/${{ github.repository }}/pages" > /dev/null 2>&1; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Pages включены"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::GitHub Pages не включены. Включите вручную: Settings -> Pages -> Source -> GitHub Actions. До этого дашборд доступен в артефактах прогона: 'site' и 'metadata-and-dashboard'."
+          fi
+
       - name: Настроить Pages
         id: pages
+        if: steps.pages_enabled.outputs.enabled == 'true'
         uses: actions/configure-pages@v6
 
       - name: Развернуть сайт
         id: deployment
+        if: steps.pages_enabled.outputs.enabled == 'true'
         uses: actions/deploy-pages@v5
+
+      - name: Сайт доступен в артефактах
+        if: steps.pages_enabled.outputs.enabled != 'true'
+        run: |
+          {
+            echo "## Сайт не опубликован"
+            echo ""
+            echo "Pages в репозитории не включены — включаются вручную:"
+            echo "**Settings → Pages → Build and deployment → Source → GitHub Actions**."
+            echo ""
+            echo "До этого сайт и дашборд лежат в артефактах этого прогона:"
+            echo "- \`site/\` — собранный сайт целиком, \`site/index.html\` открывается локально;"
+            echo "- \`metadata-and-dashboard\` — \`reports/dashboard.html\`."
+            echo ""
+            echo "Обучение при этом выполнено полностью, его результат не пострадал."
+          } >> "$GITHUB_STEP_SUMMARY"
 
