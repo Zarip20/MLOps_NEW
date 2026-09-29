@@ -1,0 +1,15 @@
+# Прямые зависимости проекта.
+# Версии зафиксированы по фактически проверенному прогону всех 48 батчей
+# (см. PLAN.md, Волна 0.4). Транзитивные зависимости закреплены
+# в requirements-lock.txt.
+#
+# Установка:
+#   python -m venv .venv
+#   .venv\Scripts\python -m pip install -r requirements.txt
+
+pandas==3.0.6
+numpy==2.5.3
+scikit-learn==1.9.1
+scipy==1.18.1
+pyyaml==6.0.3
+mlxtend==0.25.0
