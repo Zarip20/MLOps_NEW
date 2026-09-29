@@ -95,7 +95,7 @@ jobs:
 
 
 def test_code_job_without_checkout_is_reported(tmp_path):
-    """Job с `run`, но без checkout, работает в пустом каталоге.
+    """Job с кодом проекта, но без checkout, работает в пустом каталоге.
 
     Самая неприятная поломка workflow: он зелёный, потому что скрипт
     не находит файлов, а падать там нечему.
@@ -108,6 +108,40 @@ jobs:
     steps:
       - uses: actions/setup-python@v7
       - run: python run.py -mode update
+"""
+    problems = check(write(tmp_path, text))
+    assert any("checkout" in problem for problem in problems)
+
+
+def test_job_calling_api_only_needs_no_checkout(tmp_path):
+    """Job, который зовёт только API GitHub, checkout не требует.
+
+    Публикация сайта получает его артефактом, а из репозитория
+    обращается к API. Требовать checkout там было бы ложным
+    замечанием: работа такая, что репозиторий ей не нужен.
+    """
+    text = """
+on: [push]
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Проверить Pages
+        run: gh api "repos/$REPO/pages" > /dev/null
+      - uses: actions/deploy-pages@v5
+"""
+    assert check(write(tmp_path, text)) == []
+
+
+def test_job_running_project_script_needs_checkout(tmp_path):
+    """Тот же линь срабатывает и на вызове скрипта из репозитория."""
+    text = """
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: bash scripts/run_pipeline.sh 12
 """
     problems = check(write(tmp_path, text))
     assert any("checkout" in problem for problem in problems)

@@ -22,6 +22,25 @@ import yaml
 #: Шаги, без которых job, ставящий `needs` на обучение, бессмыслен.
 REQUIRED_ACTIONS = ("actions/checkout", "actions/setup-python")
 
+#: Признаки того, что `run`-шаг работает с содержимым репозитория.
+#:
+#: Проверка `checkout` — это линь, а не доказательство, поэтому она
+#: опирается на конкретные признаки в тексте шага, а не на сам факт
+#: `run`. Иначе пришлось бы требовать checkout и от job, которому
+#: репозиторий не нужен вовсе: публикация сайта получает его отдельным
+#: артефактом, а из репозитория зовёт только API GitHub.
+WORKSPACE_MARKERS = (
+    "run.py",
+    "src/",
+    "tests/",
+    "scripts/",
+    "pytest",
+    "python -m",
+    "pip install",
+    "bash ",
+    "sh ",
+)
+
 
 def load(path: Path) -> dict[str, Any]:
     """Разобрать workflow. Ключ `on` YAML превращает в True — учитываем это."""
@@ -78,18 +97,22 @@ def check(path: Path) -> list[str]:
             for step in steps
             if isinstance(step, dict)
         ]
-        runs_code = any(
-            isinstance(step, dict) and "run" in step for step in steps
+        # Job, который кладёт артефакты, обязан сначала получить
+        # репозиторий: иначе он будет работать с пустым рабочим
+        # каталогом и тихо ничего не сделает. Требование относится к
+        # шагам, которые действительно обращаются к файлам проекта.
+        scripts = "\n".join(
+            str(step.get("run", ""))
+            for step in steps
+            if isinstance(step, dict) and "run" in step
         )
-
-        # Job, который кладёт артефакты, обязан сначала получить репозиторий
-        # и поставить интерпретатор: иначе он будет работать с пустым
-        # рабочим каталогом.
-        if any(action.startswith(REQUIRED_ACTIONS) for action in uses) or runs_code:
+        if not uses and scripts:
+            problems.append(f"{path}: job {name!r}: шаги без действий")
+        elif any(marker in scripts for marker in WORKSPACE_MARKERS):
             if not any(action.startswith("actions/checkout") for action in uses):
                 problems.append(
                     f"{path}: job {name!r} не делает checkout, "
-                    f"но использует код или готовое окружение"
+                    f"но его шаги работают с файлами проекта"
                 )
 
     return problems
