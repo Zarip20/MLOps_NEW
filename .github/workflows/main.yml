@@ -1,0 +1,257 @@
+name: MLOps CI Pipeline
+
+# Триггеры: push и pull request в main, ручной запуск и расписание.
+# schedule нужен для сценария CRON-инкрементального обучения, при котором
+# job дообучает только новые батчи, продолжая с состояния прошлого запуска.
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      n_batches:
+        description: 'Сколько батчей обработать (пусто — все оставшиеся)'
+        required: false
+        default: '12'
+        type: string
+      refresh:
+        description: 'Начать с нуля, удалив накопленное состояние'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    # 03:17 по будням. Минута выбрана не «в час»: в это время на
+    # публичных репозиториях меньше всего одновременных запусков.
+    - cron: '17 3 * * 1-5'
+
+concurrency:
+  # Один прогон конвейера за раз: два параллельных обучения писали бы
+  # в одни и те же артефакты.
+  group: mlops-pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Тесты
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+
+      - name: Установка зависимостей
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-lock.txt pytest
+
+      - name: Проверка синтаксиса и конфигурации
+        run: |
+          python -m compileall -q run.py src tests
+          python -c "from src.config import load_config; c = load_config(); print('config_hash =', c.config_hash)"
+
+      - name: Проверка workflow
+        # Опечатка в YAML останавливает запуск целиком и до выполнения
+        # какого-либо кода, поэтому файл проверяется отдельно.
+        run: python -m tests.check_workflow .github/workflows/main.yml
+
+      - name: Модульные тесты
+        run: pytest tests -v
+
+  train:
+    name: Обучение и дообучение
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          # Версия совпадает с той, на которой проверен полный прогон
+          # всех 48 батчей локально.
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+
+      - name: Установка зависимостей
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-lock.txt
+
+      - name: Восстановление состояния прошлого запуска
+        uses: actions/cache@v6
+        with:
+          # Без этого каждый запуск начинает обучение с нуля, и
+          # инкрементальный сценарий невозможен: нечего дообучать.
+          path: |
+            state.json
+            models
+            data/metadata
+            data/processed
+            data/rules.json
+          key: mlops-state-${{ github.run_id }}
+          restore-keys: |
+            mlops-state-
+          # Стандартные 7 дней означают, что после выключения расписания
+          # состояние протухнет и дообучение начнётся заново. 30 дней
+          # стоят копейки: на 48 батчах кэш занимает около 25 МБ.
+          retention-days: 30
+
+      - name: Сброс состояния
+        if: ${{ inputs.refresh == true || github.event_name == 'push' }}
+        run: |
+          rm -rf models data/metadata data/processed
+          rm -f state.json data/rules.json
+          echo "Состояние очищено — обучение с нуля"
+
+      - name: Подготовка данных и обучение
+        env:
+          # Значение берётся из ручного ввода; по умолчанию 12 (решение Р-3).
+          N_BATCHES: ${{ inputs.n_batches || '12' }}
+        run: |
+          chmod +x scripts/run_pipeline.sh
+          bash scripts/run_pipeline.sh "$N_BATCHES" 2>&1 | tee training.log
+
+      - name: Сохранение состояния для следующего запуска
+        uses: actions/cache/save@v6
+        if: always()
+        with:
+          path: |
+            state.json
+            models
+            data/metadata
+            data/processed
+            data/rules.json
+          key: mlops-state-${{ github.run_id }}
+          retention-days: 30
+
+      - name: Выгрузка логов
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: training-logs
+          path: |
+            training.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Выгрузка отчётов
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reports
+          path: |
+            reports/*.txt
+            reports/*.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Выгрузка сериализованной модели
+        # Требование задания 2: модель, допускающая запуск извне.
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: models
+          path: |
+            models/*.pkl
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Выгрузка метаданных и дашборда
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: metadata-and-dashboard
+          path: |
+            data/metadata/*.json
+            data/rules.json
+            reports/dashboard.html
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Выгрузка собранного сайта
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: site
+          path: |
+            site/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Передать сайт на развёртывание
+        # Pages принимает только каталог, поэтому он передаётся отдельным
+        # артефактом после успешного обучения: публиковать нечего,
+        # если обучение не завершилось.
+        if: success()
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site/
+
+      - name: Краткий итог в описании запуска
+        if: always()
+        run: |
+          {
+            echo "## Итог прогона"
+            echo ""
+            if [ -d data/metadata ]; then
+              echo "Обработано батчей: $(ls -1 data/metadata/quality_*.json 2>/dev/null | wc -l)"
+            else
+              echo "Метаданные отсутствуют"
+            fi
+            echo ""
+            echo "### Модели"
+            echo '```'
+            ls -la models 2>/dev/null || echo "нет каталога models"
+            echo '```'
+            echo ""
+            REPORT=$(ls -1 reports/summary_*.txt 2>/dev/null | sort | tail -n 1)
+            if [ -n "$REPORT" ]; then
+              echo "### Последний отчёт ($(basename "$REPORT"))"
+              echo '```'
+              head -n 60 "$REPORT"
+              echo '```'
+            fi
+            echo ""
+            if [ -f site/meta.json ]; then
+              echo "### Опубликованный сайт"
+              echo '```'
+              cat site/meta.json
+              echo '```'
+            else
+              echo "Сайт не собран"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Публикация дашборда (GitHub Pages)
+    runs-on: ubuntu-latest
+    needs: train
+    # Публикация не должна ронять прогон обучения. Сайт — витрина
+    # результата, а не условие его успешности: если Pages не настроен
+    # или доступ закрыт, обучение и все артефакты остаются в силе.
+    continue-on-error: true
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Настроить Pages
+        id: pages
+        uses: actions/configure-pages@v6
+
+      - name: Развернуть сайт
+        id: deployment
+        uses: actions/deploy-pages@v5
+
