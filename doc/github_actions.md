@@ -13,7 +13,7 @@
 | Workflow | `.github/workflows/main.yml` |
 | Исходный набор данных | `data/motor_data14-2018.zip` (6,4 МБ) |
 | Пин зависимостей | `requirements-lock.txt` |
-| Тесты | `tests/` (203 теста) |
+| Тесты | `tests/` (205 тестов) |
 
 Распакованный CSV (48 МБ), батчи, модели и отчёты в репозиторий **не
 попадают** — они перечислены в `.gitignore` и создаются прогоном.
@@ -83,14 +83,14 @@ git ls-files data/
 
 ```
 test  →  train  →  publish
-203      48        дашборд
- теста   батчей    на Pages
+205      48        дашборд
+тестов   батчей    на Pages
 ```
 
 ### Что смотреть в каждом
 
 **`test`** (~40 секунд) — компиляция, валидация `config.yaml`, проверка
-самого workflow и 203 теста. Упало здесь — правьте до обучения:
+самого workflow и 205 тестов. Упало здесь — правьте до обучения:
 дальше запускать бессмысленно.
 
 **`train`** (~6 минут при 12 батчах, ~15 при 48) — основная работа.
@@ -105,8 +105,9 @@ test  →  train  →  publish
 
 ## 4. Включить GitHub Pages
 
-Это нужно сделать один раз. Без этого job `publish` будет
-предупреждать, а не публиковать.
+Это нужно сделать один раз. Без этого job `publish` не публикует
+ничего: он завершится зелёным с предупреждением, а дашборд останется
+доступен в артефактах прогона.
 
 1. **Settings → Pages**.
 2. **Build and deployment → Source**: выберите **GitHub Actions**.
@@ -118,6 +119,34 @@ test  →  train  →  publish
 
 Проверить можно так же: **Actions** → последний прогон → job
 **Публикация дашборда (GitHub Pages)** → ссылка в описании окружения.
+
+### Если job упал с «Get Pages site failed: Not Found»
+
+Это самая частая первая ошибка, и она **не означает**, что в репозитории
+чего-то не хватает. Pages — настройка самого репозитория, а не файл в
+нём, поэтому в коммит её положить нельзя.
+
+Признак: в логе `actions/configure-pages` —
+
+```
+Error: Get Pages site failed. Please verify that the repository has
+Pages enabled and configured to build using GitHub Actions
+Error: HttpError: Not Found
+```
+
+Что делать: ровно то, что в разделе 4 выше — **Settings → Pages →
+Source → GitHub Actions → Save**. После этого можно не перезапускать
+прогон, а нажать **Run workflow** вручную, либо дождаться ближайшего
+срабатывания расписания.
+
+Автоматически включить Pages из workflow нельзя: параметр
+`enablement: true` у `actions/configure-pages` требует персональный
+токен (PAT) со.scope `repo`, а не встроенный `GITHUB_TOKEN`. Создавать
+секрет ради одной настройки нецелесообразно.
+
+После исправления job останется зелёным в любом случае: если Pages
+выключены, он теперь не падает, а пишет в сводку запуска, где искать
+дашборд в артефактах.
 
 > На бесплатном плане Pages работает для публичных репозиториев.
 > Для приватного репозитория нужен тариф GitHub Pro/Team — иначе
@@ -211,7 +240,7 @@ Workflow срабатывает по cron `17 3 * * 1-5` — будни в 03:17
 |---|---|---|
 | Упал `test`, ошибка конфигурации | Невалидный `config.yaml` | Запустить локально `python run.py -mode init`, прочитать сообщение |
 | Упал `train` на `init` | Не загружен архив данных | `git ls-files data/` — должен быть `.zip` |
-| Упал `publish` | Pages не включён | `Settings → Pages → Source → GitHub Actions` |
+| Упал `publish` | Pages не включены в репозитории | `Settings → Pages → Source → GitHub Actions` (подробно — в разделе 4) |
 | Артефактов нет | `train` упал до их выгрузки | Смотреть лог в `training-logs` |
 | Кэш состояния пуст, обучение с нуля | Кэш истёк (7 дней без обращений) или это первый `push` | Ожидаемо; состояние восстановится со следующего сохранения |
 
@@ -235,7 +264,7 @@ bash scripts/run_pipeline.sh 12
 ## 8. Проверка перед сдачей
 
 ```powershell
-python -m pytest tests -q                    # 203 теста
+python -m pytest tests -q                    # 205 тестов
 python -m tests.check_workflow .github/workflows/main.yml
 python run.py -mode init
 python run.py -mode update -n 2
