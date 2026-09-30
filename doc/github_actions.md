@@ -13,7 +13,7 @@
 | Workflow | `.github/workflows/main.yml` |
 | Исходный набор данных | `data/motor_data14-2018.zip` (6,4 МБ) |
 | Пин зависимостей | `requirements-lock.txt` |
-| Тесты | `tests/` (205 тестов) |
+| Тесты | `tests/` (302 теста) |
 
 Распакованный CSV (48 МБ), батчи, модели и отчёты в репозиторий **не
 попадают** — они перечислены в `.gitignore` и создаются прогоном.
@@ -83,14 +83,14 @@ git ls-files data/
 
 ```
 test  →  train  →  publish
-205      48        дашборд
-тестов   батчей    на Pages
+301      48        дашборд
+ тест    батчей    на Pages
 ```
 
 ### Что смотреть в каждом
 
 **`test`** (~40 секунд) — компиляция, валидация `config.yaml`, проверка
-самого workflow и 205 тестов. Упало здесь — правьте до обучения:
+самого workflow и 302 теста. Упало здесь — правьте до обучения:
 дальше запускать бессмысленно.
 
 **`train`** (~6 минут при 12 батчах, ~15 при 48) — основная работа.
@@ -264,7 +264,7 @@ bash scripts/run_pipeline.sh 12
 ## 8. Проверка перед сдачей
 
 ```powershell
-python -m pytest tests -q                    # 205 тестов
+python -m pytest tests -q                    # 302 теста
 python -m tests.check_workflow .github/workflows/main.yml
 python run.py -mode init
 python run.py -mode update -n 2

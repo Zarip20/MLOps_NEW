@@ -100,6 +100,11 @@ class TrainingOutcome:
     notes: list[str] = field(default_factory=list)
     preprocessor: Any = None
     train_part: pd.DataFrame | None = None
+    #: Фактически применённые настройки по каждой модели. Нужны для
+    #: Meta Learning (7.b.iii): без них по накопленным прогонам нельзя
+    #: оценить влияние настроек, потому что неизвестно, чем именно
+    #: обучалась та или иная версия.
+    hyperparameters: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def best_model_name(self) -> str | None:
@@ -371,6 +376,7 @@ def train_batch(
     models: dict[str, Any] = {}
     durations: dict[str, float] = {}
     metrics: dict[str, dict[str, Any]] = {}
+    hyperparameters: dict[str, dict[str, Any]] = {}
 
     for name in model_order(config):
         model_cfg = config.models.get(name, {})
@@ -383,7 +389,7 @@ def train_batch(
         model_x = store_x if use_store else x_train
         model_y = store_y if use_store else y_train
 
-        model, note = _train_one(
+        model, note, mode = _train_one(
             name, config, model_cfg, existing.get(name), model_x, model_y,
             store_rows if use_store else 0,
         )
@@ -396,6 +402,10 @@ def train_batch(
 
         models[name] = model
         metrics[name] = evaluate_model(name, model, x_val, y_val)
+        hyperparameters[name] = _effective_hyperparameters(
+            name, config, model_cfg, model, len(model_x),
+            store_rows if use_store else 0, mode,
+        )
 
     if not models:
         raise InsufficientDataError(
@@ -413,7 +423,76 @@ def train_batch(
         notes=outcome_notes,
         preprocessor=preprocessor,
         train_part=train_part,
+        hyperparameters=hyperparameters,
     )
+
+
+def _effective_hyperparameters(
+    name: str,
+    config: Config,
+    model_cfg: dict[str, Any],
+    model: Any,
+    rows_used: int,
+    store_rows: int,
+    mode: str,
+) -> dict[str, Any]:
+    """Что фактически применено к одной модели на этом батче.
+
+    Собирается из двух источников: параметров конструктора из
+    конфигурации и состояния обученного объекта. Второй источник
+    нужен для настроек, которые меняет не конфигурация, а сам
+    scikit-learn: `max_iter` у `MLPClassifier` — это достигнутое число
+    итераций, а не заданное, и подставлять заданное значило бы
+    приписать модели несуществующее качество.
+
+    Признак `training_mode` различает обучение с нуля и дообучение.
+    Он передаётся из `_train_one`, а не вычисляется здесь заново:
+    иначе записанный режим мог бы разойтись с тем, что на самом деле
+    сделало обучение, а расхождение в метаданных заметно позже всего.
+
+    У `mlp` режим меняется уже на первом батче: сначала обучение с
+    нуля, затем дообучение. Это единственная настройка, которая во
+    всём прогоне действительно варьируется, и потому только по ней
+    влияние можно оценить статистически.
+    """
+    params = constructor_args(config, name)
+    fitted = getattr(model, "get_params", lambda: {})() or {}
+
+    result: dict[str, Any] = {}
+    for key in sorted(params):
+        value = params[key]
+        if isinstance(value, (int, float, str, bool)) or value is None:
+            result[key] = value
+
+    # Достигнутые, а не заданные значения — только те, что у них есть.
+    if "max_iter" in fitted:
+        result["max_iter_reached"] = fitted.get("max_iter")
+    if "n_iter_" in fitted and fitted.get("n_iter_") is not None:
+        reached = fitted.get("n_iter_")
+        try:
+            result["n_iter_reached"] = int(np.max(reached))
+        except (TypeError, ValueError):
+            result["n_iter_reached"] = None
+
+    result["training_mode"] = mode
+    if "epochs_per_batch" in model_cfg:
+        result["epochs_per_batch"] = int(model_cfg.get("epochs_per_batch", 1))
+    result["balancing"] = _balancing_used(model_cfg, fitted)
+    result["rows_used"] = int(rows_used)
+    result["store_rows"] = int(store_rows)
+    return result
+
+
+def _balancing_used(model_cfg: dict[str, Any], fitted: dict[str, Any]) -> str:
+    """Как именно в этом прогоне компенсировался дисбаланс классов.
+
+    `class_weight` задан в конструкторе — дисбаланс учтён им, и веса
+    образцов не применяются: одновременное использование обоих
+    механизмов компенсировало бы дисбаланс дважды.
+    """
+    if fitted.get("class_weight") not in (None, "balanced"):
+        return "class_weight"
+    return f"sample_weight:{model_cfg.get('balancing', 'balanced')}"
 
 
 def _train_one(
@@ -424,20 +503,32 @@ def _train_one(
     x_train: Any,
     y_train: np.ndarray,
     store_rows: int,
-) -> tuple[Any, str]:
+) -> tuple[Any, str, str]:
     """Обучить одну модель с учётом её специфики.
 
     Инкрементальное обучение поддерживает только `mlp` — у остальных
     моделей метода `partial_fit` нет, и они каждый раз обучаются заново.
+
+    Returns:
+        `(модель, примечание, режим)`, где режим — `partial_fit` или
+        `scratch`. Он возвращается отсюда, а не вычисляется на стороне,
+        именно чтобы запись в метаданных не могла разойтись с тем,
+        что было сделано на самом деле.
     """
     use_partial = bool(model_cfg.get("partial_fit", False)) and hasattr(
         existing, "partial_fit"
     )
 
     if use_partial:
-        return _train_incremental(name, model_cfg, existing, x_train, y_train)
+        model, note = _train_incremental(
+            name, model_cfg, existing, x_train, y_train
+        )
+        return model, note, "partial_fit"
 
-    return _train_from_scratch(name, config, model_cfg, x_train, y_train, store_rows)
+    model, note = _train_from_scratch(
+        name, config, model_cfg, x_train, y_train, store_rows
+    )
+    return model, note, "scratch"
 
 
 def _train_incremental(

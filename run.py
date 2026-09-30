@@ -24,7 +24,6 @@ from pathlib import Path
 from src.config import ConfigError, load_config
 from src.logging_setup import configure_logging
 from src.pipeline import Pipeline, PipelineError
-from src.publish import build_site
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -178,17 +177,11 @@ def _dispatch(pipeline: Pipeline, args: argparse.Namespace) -> int:
         return EXIT_OK
 
     if mode == "publish":
-        # Сайт для GitHub Pages (задание 2, пункт 2.b.iii). Пустой сайт
-        # считаем успехом: публикация не должна ронять прогон обучения,
-        # который уже отработал, но в сводке запуска это будет видно.
-        result = build_site(config)
-        print(f"Сайт собран: {result.root}")
-        print(f"  файлов: {len(result.files)}, объём: "
-              f"{result.total_bytes / 1024:.1f} КБ")
-        if result.dashboard is None:
-            print("  ВНИМАНИЕ: дашборд не опубликован (нет метаданных)", file=sys.stderr)
-        if result.skipped:
-            print(f"  не опубликовано: {', '.join(sorted(set(result.skipped)))}")
+        # Сайт для GitHub Pages (задание 2, пункт 2.b.iii). Сборкой
+        # занимается слой представлений, точка входа только запрашивает
+        # результат: иначе вывод стал бы частью контроллера (7.b.iv).
+        site = pipeline.publish()
+        print(f"Сайт собран: {site}")
         return EXIT_OK
 
     if mode == "summary":

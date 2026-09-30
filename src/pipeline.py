@@ -27,8 +27,10 @@ import pandas as pd
 
 from src import association, data_collection
 from src.collector import BatchCollector
-from src.config import Config
+from src.config import Config, ConfigError
 from src.dashboard import build_dashboard
+from src.inference import SafePredictor, remember_training_ranges, validate_input
+from src.meta import analyse as analyse_meta
 from src.data_quality import DataQualityEvaluator
 from src.drift import DriftMonitor
 from src.explain import feature_names_from_preprocessor, global_explanation
@@ -38,13 +40,31 @@ from src.preprocessing import (
     feature_fingerprint,
     fingerprint_hash,
     input_feature_names,
+    known_categories,
+)
+from src.preprocessing_sweep import (
+    evaluate as evaluate_variants,
+)
+from src.preprocessing_sweep import (
+    pick as pick_variant,
+)
+from src.preprocessing_sweep import (
+    should_run as should_sweep,
 )
 from src.registry import ModelRegistry, QualityGate
 from src.report import build_report
 from src.rules import RuleSet
 from src.state import StateStore
+from src.views import PipelineContext, default_registry
 from src.storage import TrainingStore
-from src.training import InsufficientDataError, load_models, save_model, train_batch
+from src.training import (
+    InsufficientDataError,
+    constructor_args,
+    load_models,
+    save_model,
+    split_batch,
+    train_batch,
+)
 from src.utils import (
     Stopwatch,
     atomic_pickle_dump,
@@ -52,6 +72,7 @@ from src.utils import (
     load_json,
     parse_datetime,
     peak_memory_mb,
+    read_artifacts,
     safe_pickle_load,
     save_json,
     set_seed,
@@ -76,13 +97,29 @@ def _fmt_f1(value: Any) -> str:
 
 
 class Pipeline:
-    """Оркестратор одного прогона конвейера."""
+    """Оркестратор одного прогона конвейера.
 
-    def __init__(self, config: Config) -> None:
+    Находится в слое контроллера: знает порядок этапов и ничего не
+    знает о том, как считается качество, обучаются модели и строится
+    вывод. Доменные вычисления живут в отдельных модулях, вывод
+    вынесен за порты представлений (7.b.iv).
+    """
+
+    def __init__(self, config: Config, views: Any = None) -> None:
         self.config = config
         self.state = StateStore(config.state_file, root=config.root)
         self.watch = Stopwatch()
         set_seed(int(config.run.get("seed", 42)))
+
+        # Источники данных проверяются здесь, а не в `init`: неверный
+        # список источников должен быть виден на старте, а не через
+        # минуту, когда конвейер уже распаковал архив и нарезал батчи.
+        try:
+            self.sources = data_collection.sources_from_config(config)
+        except data_collection.SourceError as error:
+            raise ConfigError(
+                f"Некорректный список источников данных: {error}"
+            ) from error
 
         quality_cfg = config.quality
         self.rules = RuleSet.from_config(quality_cfg["rules"])
@@ -125,6 +162,15 @@ class Pipeline:
         self.eda = config.get("eda", {})
         self._numerical_features = list(config.numerical_cols)
         self._engineered: list[str] = []
+
+        # Слой вывода подменяется снаружи: в тестах достаточно подставить
+        # объект с методом `render`, а в бою работает набор по умолчанию.
+        self.views = views or default_registry()
+
+        # Обучающие диапазоны для проверки входа при инференсе. Пусто
+        # до первого обучения: проверять нечего, и пропуск честнее,
+        # чем молчаливые границы, взятые из первого же файла.
+        self._training_ranges: dict[str, tuple[float, float]] = {}
 
     @property
     def numerical_features(self) -> list[str]:
@@ -216,9 +262,8 @@ class Pipeline:
             )
 
         with self.watch.measure("init"):
-            source = data_collection.extract_source(self.config)
-            batches = data_collection.split_into_batches(
-                self.config, source, self.state,
+            batches = data_collection.split_all_sources(
+                self.config, self.state,
                 # Сброс нужен только при явном требовании: смена набора
                 # данных и так делает список батчей другим, а повторное
                 # разбиение тех же данных оставляет нумерацию верной.
@@ -466,6 +511,23 @@ class Pipeline:
                 engineer=self._store_engineer,
             )
 
+        # Обучающие диапазоны для проверки входа (6.b.ii). Берутся из
+        # батча, на котором модель только что обучилась: брать их из
+        # всех накопленных данных значило бы сдвигать «нормальный»
+        # диапазон вслед за дрейфом, и проверка перестала бы замечать
+        # именно то, ради чего заведена.
+        self._training_ranges = remember_training_ranges(
+            target_frame, self.numerical_features
+        )
+
+        # 8.1. Перебор вариантов предобработки (3.b.ii). Запускается на
+        # батче, где препроцессор обучается заново; выбор записывается и
+        # в отчёт, и в манифест, чтобы было видно, на чём он сделан.
+        if should_sweep(config, index):
+            quality["preprocessing_sweep"] = self._sweep_preprocessing(
+                index, target_frame
+            )
+
         # 9. Реестр версий и гейт качества (АР-5). Все версии сохраняются,
         #    независимо от результата гейта: регресс должен остаться в
         #    истории, иначе непонятно, почему качество упало.
@@ -668,6 +730,62 @@ class Pipeline:
         )
         return result
 
+    def _sweep_preprocessing(
+        self, index: int, frame: pd.DataFrame
+    ) -> dict[str, Any]:
+        """Перебрать варианты предобработки и выбрать лучший (3.b.i).
+
+        Перебор обучается заново на train-части текущего батча и
+        оценивается на val-части — той же, что и обычное обучение, иначе
+        сравнение вариантов шло бы по разным данным.
+        """
+        config = self.config
+        sweep_cfg = config.get("preprocessing", {}).get("sweep", {})
+        model_name = str(sweep_cfg.get("model", "lr"))
+        metric = str(sweep_cfg.get("metric", "f1"))
+
+        train_part, val_part, notes = split_batch(
+            frame, config.validation,
+            config.validation.get("min_positive_samples", 50),
+            target=config.target_name,
+        )
+        results = evaluate_variants(
+            config,
+            frame,
+            train_part,
+            val_part,
+            config.target_name,
+            self.numerical_features,
+            config.categorical_cols,
+            model_name=model_name,
+            model_params=constructor_args(config, model_name),
+        )
+        winner = pick_variant(results, metric)
+        logger.info(
+            "Перебор предобработки на батче %d: %d вариантов, победил %s "
+            "(%s = %s)",
+            index, len(results),
+            winner.get("name", "—"), metric, winner.get(metric, "—"),
+        )
+        if winner.get("status") == "none":
+            logger.warning(
+                "Ни один вариант предобработки не построился, остаётся "
+                "базовая конфигурация"
+            )
+
+        payload = {
+            "batch_idx": index,
+            "model": model_name,
+            "metric": metric,
+            "results": results,
+            "best": winner,
+            "notes": notes,
+        }
+        # Отдельным отчётом: перебор нужен не для обучения, а чтобы
+        # решение о предобработке можно было проверить и оспорить.
+        save_json(self.config.reports_dir / "preprocessing_sweep.json", payload)
+        return payload
+
     def _prune_models(self) -> dict[str, Any]:
         """Удалить файлы давно неактуальных версий моделей.
 
@@ -867,6 +985,7 @@ class Pipeline:
                 "notes": outcome.notes,
             },
             "metrics": outcome.metrics,
+            "hyperparameters": outcome.hyperparameters,
             "registry": registry_view,
             "preprocessor": {**fingerprint, "fingerprint_hash": fingerprint_hash(fingerprint)},
             "features": quality.get("features", {}),
@@ -889,7 +1008,16 @@ class Pipeline:
     # ------------------------------------------------------------------
 
     def inference(self, file_path: str | Path) -> Path:
-        """Применить лучшую модель к новым данным."""
+        """Применить модель к новым данным с проверкой и калибровкой.
+
+        Отличие от прежней версии: вход проверяется **до** обращения к
+        модели, решения принимаются по калиброванному порогу, а при
+        неприменимости продуктовой модели прогноз уходит запасной, а не
+        прерывается (6.b.ii).
+
+        Returns:
+            Путь к файлу с исходными колонками и прогнозом.
+        """
         config = self.config
         source = Path(file_path)
         if not source.is_file():
@@ -906,12 +1034,46 @@ class Pipeline:
         # признаков, чтобы в результат не попали служебные.
         original_columns = list(pd.read_csv(source, nrows=0).columns)
         frame = pd.read_csv(source, low_memory=False)
-        missing = [column for column in config.feature_cols if column not in frame.columns]
-        if missing:
-            raise PipelineError(f"В файле для инференса нет признаков: {missing}")
 
         preprocessor = safe_pickle_load(preprocessor_path)
-        model = safe_pickle_load(model_path)
+        best_model = safe_pickle_load(model_path)
+
+        # Набор производных признаков восстанавливается из самого
+        # препроцессора: он обучается на первом батче, и пересборка
+        # списка из конфигурации дала бы матрицу другой ширины.
+        self._sync_features_from_preprocessor(preprocessor)
+
+        # Проверка входа — до любых преобразований: чтобы понять, что
+        # файлу не хватает колонок, не нужно сначала ломаться на
+        # препроцессоре.
+        validation = validate_input(
+            frame,
+            required_columns=config.feature_cols,
+            numerical_columns=config.numerical_cols,
+            known_categories=(
+                self._known_categories(preprocessor) if (
+                    config.inference_config.get("validate", {}).get("check_categories", True)
+                ) else None
+            ),
+            # Диапазоны передаются явно, а не берутся из накопленных при
+            # обучении: проверка входа не должна зависеть от того, что
+            # успел накопить процесс, — иначе результат менялся бы от
+            # порядка запусков.
+            ranges=self._training_ranges,
+            max_outlier_ratio=float(
+                config.inference_config.get("validate", {}).get(
+                    "max_outlier_ratio", 0.2
+                )
+            ),
+        )
+        if not validation.accepted:
+            raise PipelineError(
+                "Файл для инференса непригоден: " + "; ".join(validation.problems)
+            )
+        if validation.degraded:
+            logger.warning(
+                "Входные данные требуют оговорок: %s", "; ".join(validation.problems)
+            )
 
         # Набор производных признаков восстанавливается из самого
         # препроцессора: он обучается на первом батче, и пересборка
@@ -939,27 +1101,152 @@ class Pipeline:
                 f"После подготовки признаков не хватает колонок: {absent}"
             )
 
-        matrix = preprocessor.transform(frame[required])
+        # Кандидаты: продуктовая и запасная. Набор берётся из указателей
+        # `*_latest.pkl`, которые обновляются на каждом батче, поэтому
+        # запасная модель соответствует текущей схеме признаков.
+        models: dict[str, Any] = {"best": best_model}
+        fallback_name = config.inference_fallback_model
+        fallback_path = config.models_dir / f"{fallback_name}_latest.pkl"
+        if fallback_path.is_file():
+            try:
+                models[fallback_name] = safe_pickle_load(fallback_path)
+            except ValueError as error:
+                logger.warning(
+                    "Запасная модель %s не прочитана: %s", fallback_name, error
+                )
+
+        target_rate = (
+            config.target_positive_rate()
+            if config.inference_threshold_mode == "quantile" else None
+        )
+        predictor = SafePredictor(
+            models,
+            preprocessor,
+            required,
+            fallback=fallback_name,
+            threshold_mode=config.inference_threshold_mode,
+            target_positive_rate=target_rate,
+        )
+        result = predictor.predict(frame, validation)
+
         # В результат попадают только исходные колонки плюс прогноз:
         # производные признаки — служебные и пользователю не нужны.
         output = frame[original_columns].copy() if original_columns else frame.copy()
-        output["predict"] = model.predict(matrix)
-        if hasattr(model, "predict_proba"):
-            output["predict_proba"] = model.predict_proba(matrix)[:, 1]
+        output["predict"] = np.asarray(result.predictions, dtype=int)
+        if result.probabilities is not None:
+            output["predict_proba"] = np.round(
+                np.asarray(result.probabilities, dtype=float), 6
+            )
 
         output_dir = source.parent
         output_dir.mkdir(parents=True, exist_ok=True)
-        target = output_dir / f"{source.stem}_with_predict{source.suffix}"
-        output.to_csv(target, index=False)
-        logger.info("Результат сохранён: %s", target.name)
-        return target
+        target_path = output_dir / f"{source.stem}_with_predict{source.suffix}"
+        output.to_csv(target_path, index=False)
+
+        report = result.as_dict()
+        report["source"] = str(source)
+        report["target_positive_rate"] = target_rate
+        save_json(output_dir / f"{source.stem}_inference.json", report)
+
+        for note in result.notes:
+            logger.info("Инференс: %s", note)
+        share = (
+            100.0 * float(np.mean(result.predictions))
+            if len(result.predictions) else 0.0
+        )
+        logger.info(
+            "Прогноз: модель %s, положительных %.2f %%, порог %s",
+            result.model, share,
+            "не применяется" if result.threshold is None
+            else f"{result.threshold:.4f}",
+        )
+        logger.info("Результат сохранён: %s", target_path.name)
+        return target_path
+
+    def _known_categories(self, preprocessor: Any) -> dict[str, list[str]]:
+        """Значения категорий, известные по обученному препроцессору.
+
+        Источник — обученный `OneHotEncoder`, а не метаданные качества:
+        там хранится лишь несколько самых частых значений, и для `MAKE`
+        с сотнями марок этого хватило бы на то, чтобы пометить нормальные
+        значения как незнакомые.
+        """
+        return known_categories(preprocessor)
+
+    def meta_learning(self) -> Path:
+        """Анализ накопленных прогонов (Meta Learning, 7.b.iii).
+
+        Читает манифесты всех обработанных батчей и записывает
+        `reports/meta.json`: влияние настроек, влияние условий
+        обучения, динамику метрик данных и моделей, выводы словами.
+
+        Вызывается из `summary`, а не из обработки батча: анализ имеет
+        смысл только по накопленной истории, а считать его на каждом
+        батче значит платить O(n²) без выигрыша.
+        """
+        manifests = read_artifacts(self.config.metadata_dir, "run_manifest")
+        payload = analyse_meta(
+            manifests,
+            metric=self.config.meta_metric,
+            min_runs=self.config.meta_min_runs,
+        )
+        path = save_json(self.config.reports_dir / "meta.json", payload)
+        logger.info(
+            "Meta Learning: батчей %d, прогонов %d, выводов %d",
+            payload.get("n_batches", 0), payload.get("n_runs", 0),
+            len(payload.get("findings") or []),
+        )
+        return path
+
+    def publish(self) -> Path:
+        """Собрать только сайт, без отчёта и дашборда.
+
+        Отдельный метод нужен режиму `-mode publish`: он зовётся
+        отдельно от `summary` и не должен заодно переписывать отчёт.
+        Обращается к тому же порту представлений, что и `summary`,
+        иначе вывод снова стал бы частью контроллера (7.b.iv).
+        """
+        context = PipelineContext(config=self.config, state=self.state)
+        results = self.views.render_all(context, only=["site"])
+        outputs = {
+            item.view: item.path for item in results if item.ok and item.path
+        }
+        site = outputs.get("site")
+        if site is None:
+            built = ", ".join(
+                f"{item.view}: {item.error or 'ок'}" for item in results
+            )
+            raise PipelineError(f"Сайт не собран ({built})")
+        return site
 
     def summary(self) -> tuple[Path, Path]:
-        """Собрать текстовый отчёт и дашборд по истории прогонов.
+        """Построить все артефакты вывода через слой представлений.
+
+        Оркестратор не знает, какие представления зарегистрированы и в
+        каком порядке: он отдаёт контекст и получает список результатов
+        (7.b.iv). Поэтому добавление нового вида вывода — это одна
+        регистрация, а не правка этого метода.
 
         Returns:
-            (путь к текстовому отчёту, путь к дашборду).
+            (путь к текстовому отчёту, путь к дашборду) — те два
+            файла, о которых сообщает CLI. Остальные лежат в
+            `context.extras` и в каталоге отчётов.
         """
-        report = build_report(self.config, self.state)
-        dashboard = build_dashboard(self.config.reports_dir, self.config.metadata_dir)
+        context = PipelineContext(config=self.config, state=self.state)
+        results = self.views.render_all(context)
+
+        outputs = {
+            item.view: item.path for item in results if item.ok and item.path
+        }
+        for item in results:
+            if not item.ok:
+                logger.warning("Вывод %s не построен: %s", item.view, item.error)
+
+        report = outputs.get("text_report")
+        dashboard = outputs.get("html_dashboard")
+        if report is None or dashboard is None:
+            built = ", ".join(
+                f"{item.view}: {item.error or 'ок'}" for item in results
+            )
+            raise PipelineError(f"Не все артефакты вывода построены ({built})")
         return report, dashboard

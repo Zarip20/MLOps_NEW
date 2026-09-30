@@ -28,6 +28,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
 
+from src.utils import load_json, read_artifacts
+
 logger = logging.getLogger(__name__)
 
 #: Палитра. Достаточный контраст на светлом фоне, различима при
@@ -72,23 +74,7 @@ def build_dashboard(
 
 def _read_all(directory: Path, prefix: str) -> list[dict[str, Any]]:
     """Прочитать все JSON-артефакты с заданным префиксом по индексу батча."""
-    if not directory.is_dir():
-        return []
-    items: list[tuple[int, dict[str, Any]]] = []
-    for path in directory.glob(f"{prefix}_*.json"):
-        stem = path.stem.rsplit("_", 1)[-1]
-        try:
-            index = int(stem)
-        except ValueError:
-            continue
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-        except (json.JSONDecodeError, OSError):
-            continue
-        if isinstance(payload, dict):
-            items.append((index, payload))
-    return [payload for _, payload in sorted(items, key=lambda pair: pair[0])]
+    return read_artifacts(directory, prefix)
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +106,7 @@ def _render(
     ]
 
     parts.append(_section_cards(summary))
+    parts.append(_section_meta(reports_dir))
     parts.append(_section_quality(quality, summary))
     parts.append(_section_metrics(metrics, summary))
     parts.append(_section_drift(manifests))
@@ -461,6 +448,117 @@ def _section_performance(manifests: list[dict[str, Any]]) -> str:
     )
 
 
+def _section_meta(reports_dir: Path) -> str:
+    """Раздел Meta Learning: что в прогоне влияло на качество (7.b.iii)."""
+    payload = load_json(reports_dir / "meta.json")
+    if not payload:
+        return ""
+    if payload.get("verdict") != "ok":
+        return (
+            "<section><h2>Meta Learning</h2>"
+            f"<p class='muted'>{html.escape(str(payload.get('note', 'анализ не выполнялся')))}</p>"
+            "</section>"
+        )
+
+    parts: list[str] = ["<section><h2>Meta Learning: что влияло на качество</h2>"]
+    parts.append(
+        f"<p class='muted'>Прогонов {payload.get('n_runs', 0)} "
+        f"(батчей {payload.get('n_batches', 0)}), метрика "
+        f"{html.escape(str(payload.get('metric', 'f1')))}</p>"
+    )
+
+    findings = payload.get("findings") or []
+    if findings:
+        items = "".join(
+            f"<li>{html.escape(str(item))}</li>" for item in findings
+        )
+        parts.append(f"<ul class='findings'>{items}</ul>")
+
+    varied = (payload.get("settings_influence") or {}).get("varied") or []
+    if varied:
+        rows = "".join(
+            f"<tr><td class='num'>{item.get('rank', '-')}</td>"
+            f"<td>{html.escape(str(item.get('model')))}</td>"
+            f"<td>{html.escape(str(item.get('feature')))}</td>"
+            f"<td>{html.escape(str(item.get('best_value')))} "
+            f"({_fmt(item.get('best_mean'))})</td>"
+            f"<td>{html.escape(str(item.get('worst_value')))} "
+            f"({_fmt(item.get('worst_mean'))})</td>"
+            f"<td class='num'>{_fmt(item.get('spread'))}</td></tr>"
+            for item in varied
+        )
+        parts.append(
+            "<h3>Влияние настроек внутри семейства модели</h3>"
+            "<p class='muted'>Сравнение ведётся только между прогонами одной "
+            "модели. У разных моделей параметры разные, и сравнение между "
+            "ними измеряло бы разницу моделей, а не влияние параметра.</p>"
+            "<table><thead><tr><th>место</th><th>модель</th><th>настройка</th>"
+            "<th>лучшее значение</th><th>худшее значение</th>"
+            f"<th>разброс</th></tr></thead><tbody>{rows}</tbody></table>"
+        )
+
+    not_evaluated = (payload.get("settings_influence") or {}).get(
+        "not_evaluated"
+    ) or []
+    if not_evaluated:
+        items = "".join(
+            f"<li><code>{html.escape(str(item.get('feature')))}</code> — "
+            f"{html.escape(str(item.get('note')))}</li>"
+            for item in not_evaluated
+        )
+        parts.append(f"<h3>Не оценено</h3><ul class='files'>{items}</ul>")
+
+    constant = (payload.get("settings_influence") or {}).get("constant") or []
+    if constant:
+        names = ", ".join(
+            f"<code>{html.escape(str(item.get('feature')))}</code>"
+            for item in constant
+        )
+        parts.append(
+            f"<p class='muted'>Были постоянны и потому не проверены на "
+            f"влияние: {names}. Оценить можно, изменив конфигурацию и "
+            f"повторив прогон.</p>"
+        )
+
+    conditions = payload.get("condition_influence") or []
+    if conditions:
+        rows = "".join(
+            f"<tr><td>{html.escape(str(item.get('feature')))}</td>"
+            f"<td class='num'>{item.get('spearman'):+.3f}</td>"
+            f"<td class='num'>{item.get('n')}</td></tr>"
+            for item in conditions
+            if item.get("spearman") is not None
+        )
+        parts.append(
+            "<h3>Связь качества с условиями обучения</h3>"
+            "<table><thead><tr><th>признак</th><th>ρ Спирмена</th>"
+            f"<th>наблюдений</th></tr></thead><tbody>{rows}</tbody></table>"
+        )
+
+    calibration = payload.get("calibration") or []
+    if calibration:
+        rows = "".join(
+            f"<tr><td>{html.escape(str(item.get('model')))}</td>"
+            f"<td class='num'>{item.get('predicted_rate', 0) * 100:.1f} %</td>"
+            f"<td class='num'>{item.get('actual_rate', 0) * 100:.1f} %</td>"
+            f"<td class='num'>{'×' + str(item['ratio']) if item.get('ratio') else 'н/д'}</td></tr>"
+            for item in calibration
+        )
+        parts.append(
+            "<h3>Калибровка</h3>"
+            "<table><thead><tr><th>модель</th><th>предсказано положительных</th>"
+            "<th>фактически</th><th>превышение</th></tr></thead>"
+            f"<tbody>{rows}</tbody></table>"
+            "<p class='muted'>Превышение в несколько раз означает, что модель "
+            "систематически называет положительным слишком много полисов. "
+            "f1 этого не показывает: он усредняет precision и recall, и высокая "
+            "доля предсказанных положительных выглядит там как высокий recall.</p>"
+        )
+
+    parts.append("</section>")
+    return "".join(parts)
+
+
 def _section_reports(reports_dir: Path) -> str:
     files = sorted(reports_dir.glob("summary_*.txt"))[-5:] if reports_dir.is_dir() else []
     if not files:
@@ -655,5 +753,7 @@ tr:hover td{background:var(--card)}
 .legend-item{display:inline-flex;align-items:center;gap:6px}
 .legend-item i{width:12px;height:3px;border-radius:2px;display:inline-block}
 ul.consensus,ul.files{margin:6px 0;padding-left:20px;font-size:13px}
+ul.findings{margin:8px 0 14px;padding-left:22px;font-size:14px;line-height:1.5}
+ul.findings li{margin-bottom:4px}
 footer{margin-top:40px;padding-top:14px;border-top:1px solid var(--line)}
 """

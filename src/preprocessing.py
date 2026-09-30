@@ -162,6 +162,49 @@ def input_feature_names(preprocessor: ColumnTransformer) -> dict[str, list[str]]
     return result
 
 
+def known_categories(preprocessor: ColumnTransformer) -> dict[str, list[str]]:
+    """Значения категорий, которые препроцессор видел при обучении.
+
+    Берутся из обученного `OneHotEncoder`, а не из метаданных качества:
+    там хранится лишь несколько самых частых значений, и для `MAKE` с
+    сотнями марок этого хватило бы на то, чтобы пометить нормальные
+    значения как незнакомые. Кодировщик же знает ровно тот набор, на
+    котором обучался, — тот самый, относительно которого «незнакомое»
+    и имеет смысл.
+
+    Returns:
+        Словарь «колонка → известные значения»; без обученных
+        кодировщиков пустой.
+    """
+    result: dict[str, list[str]] = {}
+    try:
+        entries = getattr(preprocessor, "transformers_", None)
+        if entries is None:
+            entries = preprocessor.transformers
+    except (AttributeError, TypeError):
+        return result
+
+    for entry in entries:
+        if entry is None or not isinstance(entry, (list, tuple)) or len(entry) < 3:
+            continue
+        columns = entry[2]
+        steps = entry[1]
+        if columns is None or isinstance(columns, str):
+            continue
+        columns = list(columns)
+        if isinstance(steps, Pipeline):
+            steps = list(steps.named_steps.values())
+        elif not isinstance(steps, (list, tuple)):
+            steps = [steps]
+        for step in steps:
+            categories = getattr(step, "categories_", None)
+            if not categories:
+                continue
+            for name, values in zip(columns, categories):
+                result[str(name)] = [str(item) for item in values]
+    return result
+
+
 def verify_feature_schema(
     expected: dict[str, list[str]], frame: pd.DataFrame
 ) -> list[str]:

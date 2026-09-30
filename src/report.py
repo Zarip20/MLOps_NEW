@@ -15,27 +15,14 @@ from typing import Any, Iterable
 
 from src.config import Config
 from src.state import StateStore
-from src.utils import format_duration, load_json, save_json
+from src.utils import format_duration, load_json, read_artifacts, save_json
 
 logger = logging.getLogger(__name__)
 
 
 def _read_metadata(config: Config, prefix: str) -> list[dict[str, Any]]:
     """Прочитать все файлы метаданных с заданным префиксом, по индексу батча."""
-    directory = config.metadata_dir
-    if not directory.is_dir():
-        return []
-
-    items: list[tuple[int, dict[str, Any]]] = []
-    for path in directory.glob(f"{prefix}_*.json"):
-        try:
-            index = int(path.stem.rsplit("_", 1)[1])
-        except (IndexError, ValueError):
-            continue
-        payload = load_json(path)
-        if isinstance(payload, dict):
-            items.append((index, payload))
-    return [payload for _, payload in sorted(items, key=lambda pair: pair[0])]
+    return read_artifacts(config.metadata_dir, prefix)
 
 
 def _fmt(value: Any, digits: int = 4) -> str:
@@ -102,6 +89,8 @@ def build_report(config: Config, state: StateStore) -> Path:
 
     lines.extend(_section_hyperparameters(config))
     lines.extend(_section_performance(manifests))
+    lines.extend(_section_meta(load_json(config.reports_dir / "meta.json")))
+    lines.extend(_section_sweep(config))
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -116,6 +105,7 @@ def build_report(config: Config, state: StateStore) -> Path:
             "quality": quality,
             "metrics": metrics,
             "manifests": manifests,
+            "meta": load_json(config.reports_dir / "meta.json"),
         },
     )
 
@@ -560,6 +550,192 @@ def _section_hyperparameters(config: Config) -> list[str]:
     dump("предобработка", config.data.get("preprocessing", {}))
     lines.append("")
     dump("ассоциативные правила", config.association)
+    lines.append("")
+    return lines
+
+
+def _section_meta(payload: dict[str, Any] | None) -> list[str]:
+    """Meta Learning: что в прогоне влияло на качество (7.b.iii)."""
+    lines = ["-" * 78, "10. META LEARNING: ВЛИЯНИЕ НА КАЧЕСТВО", "-" * 78]
+    lines.append("")
+
+    if not payload or payload.get("verdict") != "ok":
+        note = (payload or {}).get("note", "анализ не выполнялся")
+        lines.append(f"  {note}")
+        lines.append("")
+        return lines
+
+    metric = payload.get("metric", "f1")
+    lines.append(
+        f"  Прогонов проанализировано: {payload.get('n_runs', 0)} "
+        f"(батчей {payload.get('n_batches', 0)}), метрика {metric}"
+    )
+    lines.append("")
+
+    findings = payload.get("findings") or []
+    if findings:
+        lines.append("  Выводы:")
+        for item in findings:
+            lines.append(f"    · {item}")
+        lines.append("")
+
+    varied = (payload.get("settings_influence") or {}).get("varied") or []
+    lines.append("  Настройки, которые менялись внутри одной модели:")
+    if varied:
+        lines.append(
+            "    (сравнение только внутри семейства: у каждой модели свои"
+        )
+        lines.append(
+            "     значения параметров, и сравнение между моделями измеряло бы"
+        )
+        lines.append("     разницу моделей, а не влияние параметра)")
+        lines.append("")
+        lines.extend(_table(
+            [
+                [
+                    str(item.get("rank", "-")),
+                    str(item.get("model")),
+                    str(item.get("feature")),
+                    f"{item.get('best_value')} → {_fmt(item.get('best_mean'))}",
+                    f"{item.get('worst_value')} → {_fmt(item.get('worst_mean'))}",
+                    _fmt(item.get("spread")),
+                ]
+                for item in varied
+            ],
+            ["место", "модель", "настройка", "лучшее", "худшее", "разброс"],
+        ))
+    elif not payload.get("settings_recorded"):
+        # Различие существенно: «настроек не записано» и «настройки не
+        # менялись» — это разные диагнозы, и свести их к одному
+        # значит скрыть, откуда взялся пробел в выводах.
+        lines.append(
+            "    нет: применённые настройки в манифестах этих батчей не "
+            "записаны. Они фиксируются начиная со следующего прогона."
+        )
+    else:
+        lines.append(
+            "    нет: ни одна настройка не менялась внутри своей модели, "
+            "сравнивать нечего. Оценить влияние можно, изменив конфигурацию."
+        )
+    lines.append("")
+
+    not_evaluated = (payload.get("settings_influence") or {}).get(
+        "not_evaluated"
+    ) or []
+    if not_evaluated:
+        lines.append("  Не оценено:")
+        for item in not_evaluated:
+            lines.append(f"    · {item.get('feature')} — {item.get('note')}")
+        lines.append("")
+
+    constant = (payload.get("settings_influence") or {}).get("constant") or []
+    if constant:
+        lines.append(
+            "  Настройки, не проверенные на влияние (были постоянны): "
+            + ", ".join(sorted(str(item.get("feature")) for item in constant))
+        )
+        lines.append(
+            "    Оценить их можно, изменив конфигурацию и повторив прогон: "
+            "по постоянному признаку сравнивать нечего."
+        )
+        lines.append("")
+
+    conditions = payload.get("condition_influence") or []
+    if conditions:
+        lines.append("  Связь качества с условиями обучения (ρ Спирмена):")
+        lines.extend(_table(
+            [
+                [
+                    str(item.get("feature")),
+                    f"{item.get('spearman'):+.3f}" if item.get("spearman") is not None else "н/д",
+                    str(item.get("n")),
+                ]
+                for item in conditions
+            ],
+            ["признак", "ρ", "наблюдений"],
+        ))
+        lines.append("")
+
+    calibration = payload.get("calibration") or []
+    if calibration:
+        lines.append("  Калибровка: доля предсказанных положительных против фактической")
+        lines.extend(_table(
+            [
+                [
+                    str(item.get("model")),
+                    f"{item.get('predicted_rate', 0) * 100:.1f} %",
+                    f"{item.get('actual_rate', 0) * 100:.1f} %",
+                    f"×{item.get('ratio')}" if item.get("ratio") else "н/д",
+                ]
+                for item in calibration
+            ],
+            ["модель", "предсказано", "фактически", "превышение"],
+        ))
+        lines.append(
+            "    Превышение означает систематическое завышение: модель "
+            "называет положительным слишком много полисов. Это ограничивает"
+        )
+        lines.append(
+            "    точность положительного класса сильнее, чем показывает f1."
+        )
+        lines.append("")
+
+    return lines
+
+
+def _section_sweep(config: Config) -> list[str]:
+    """Результаты перебора вариантов предобработки (3.b.i)."""
+    payload = load_json(config.reports_dir / "preprocessing_sweep.json")
+    if not payload:
+        return []
+
+    lines = ["-" * 78, "11. ПЕРЕБОР ВАРИАНТОВ ПРЕДОБРАБОТКИ", "-" * 78]
+    lines.append("")
+    lines.append(
+        f"  Батч {payload.get('batch_idx')}, модель {payload.get('model')!r}, "
+        f"метрика {payload.get('metric')!r}"
+    )
+    lines.append(
+        "  Ограничение: выбор сделан на одной модели и одном батче. Дерево, лес"
+    )
+    lines.append(
+        "  и нейросеть реагируют на масштаб и импутацию иначе, поэтому перенос"
+    )
+    lines.append("  выбора на них автоматически не выполняется.")
+    lines.append("")
+
+    usable = [item for item in payload.get("results", []) if item.get("status") == "ok"]
+    if usable:
+        lines.extend(_table(
+            [
+                [
+                    str(item.get("name")),
+                    _fmt(item.get("f1")),
+                    _fmt(item.get("roc_auc")),
+                    str(item.get("n_features")),
+                    f"{item.get('seconds', 0):.2f}",
+                ]
+                for item in usable
+            ],
+            ["вариант", "f1", "roc_auc", "признаков", "секунд"],
+        ))
+
+    failed = [item for item in payload.get("results", []) if item.get("status") != "ok"]
+    for item in failed:
+        lines.append(f"  {item.get('name')}: не построился — {item.get('error')}")
+
+    best = payload.get("best") or {}
+    if best.get("status") == "none":
+        lines.append("")
+        lines.append(
+            f"  Ни один вариант не построился, остаётся базовая конфигурация."
+        )
+    else:
+        lines.append("")
+        lines.append(
+            f"  Победил {best.get('name')} "
+            f"({payload.get('metric')} = {_fmt(best.get(payload.get('metric')))})"
+        )
     lines.append("")
     return lines
 

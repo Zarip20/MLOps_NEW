@@ -16,12 +16,17 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from src.utils import load_json
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_NAME = "config.yaml"
 
@@ -173,6 +178,95 @@ class Config:
     @property
     def log_file(self) -> Path:
         return self.root / str(self.run.get("log_file", "training.log"))
+
+    @property
+    def inference_config(self) -> dict[str, Any]:
+        """Настройки устойчивого инференса (6.b.ii)."""
+        section = self.get("inference", {})
+        if not isinstance(section, dict):
+            raise ConfigError("секция inference должна быть словарём")
+        return section
+
+    @property
+    def inference_threshold_mode(self) -> str:
+        """Как выбирается порог принятия решения: `quantile` или `fixed`."""
+        mode = str(
+            self.inference_config.get("threshold_mode", "quantile")
+        ).strip().lower()
+        if mode not in ("quantile", "fixed"):
+            raise ConfigError(
+                f"inference.threshold_mode={mode!r} не поддерживается; "
+                f"допустимо: quantile, fixed"
+            )
+        return mode
+
+    @property
+    def inference_fallback_model(self) -> str:
+        """Модель, на которую переходим, если продуктовая неприменима."""
+        return str(self.inference_config.get("fallback_model", "lr"))
+
+    def target_positive_rate(self, fallback: float = 0.05) -> float:
+        """Доля положительных решений, к которой подбирается порог.
+
+        `auto` читается из последних обработанных батчей: доля положи-
+        тельного класса падает со временем (с 11 % до 2,4 % за четыре
+        года), и фиксированное число устарело бы молча — порог
+        подстроился бы под давно неверную долю, и никто бы этого не
+        заметил.
+        """
+        declared = self.inference_config.get("target_positive_rate", "auto")
+        if isinstance(declared, (int, float)) and not isinstance(declared, bool):
+            value = float(declared)
+            if not 0 < value < 1:
+                raise ConfigError(
+                    f"inference.target_positive_rate={value} вне диапазона (0, 1)"
+                )
+            return value
+
+        if str(declared).strip().lower() != "auto":
+            raise ConfigError(
+                f"inference.target_positive_rate={declared!r}: ожидается "
+                f"число в (0, 1) или 'auto'"
+            )
+
+        for path in sorted(
+            self.metadata_dir.glob("quality_*.json"), reverse=True
+        )[:self._RATE_LOOKBACK]:
+            payload = load_json(path) or {}
+            rate = (payload.get("target") or {}).get("positive_rate")
+            if isinstance(rate, (int, float)) and 0 < rate < 1:
+                return float(rate)
+        logger.warning(
+            "Доля положительных не найдена в метаданных, берётся %s",
+            fallback,
+        )
+        return float(fallback)
+
+    #: Сколько последних батчей просматривается в поиске доли класса.
+    _RATE_LOOKBACK = 5
+
+    @property
+    def meta_metric(self) -> str:
+        value = str(self.get("meta_learning", {}).get("metric", "f1"))
+        if value not in ("f1", "precision", "recall", "roc_auc"):
+            raise ConfigError(
+                f"meta_learning.metric={value!r} не поддерживается; "
+                f"допустимо: f1, precision, recall, roc_auc"
+            )
+        return value
+
+    @property
+    def meta_min_runs(self) -> int:
+        """С какого числа батчей выводы Meta Learning считаются обоснованными."""
+        try:
+            value = int(self.get("meta_learning", {}).get("min_batches", 3))
+        except (TypeError, ValueError) as error:
+            raise ConfigError(
+                f"meta_learning.min_batches должно быть целым числом: {error}"
+            ) from error
+        if value < 1:
+            raise ConfigError("meta_learning.min_batches должно быть не меньше 1")
+        return value
 
     def ensure_dirs(self) -> None:
         """Создать каталоги артефактов. Вызывается один раз оркестратором."""

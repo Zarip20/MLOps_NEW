@@ -90,6 +90,35 @@ def load_json(path: str | os.PathLike[str], default: Any = None) -> Any:
         return default
 
 
+def read_artifacts(
+    directory: str | os.PathLike[str], prefix: str
+) -> list[dict[str, Any]]:
+    """Прочитать все JSON-артефакты `prefix_NNNN.json` по возрастанию NNNN.
+
+    Метаданные батчей пишутся по одному файлу на батч, и читать их надо
+    в хронологическом порядке. Номер батча берётся из последнего
+    компонента имени, а время изменения файла для этого не годится: в
+    CI пересборка меняет его у всех файлов разом.
+
+    Повреждённый или нечитаемый файл пропускается, а не обрывает чтение:
+    один битый артефакт иначе лишил бы отчёта всех остальных батчей.
+    """
+    folder = Path(directory)
+    if not folder.is_dir():
+        return []
+
+    items: list[tuple[int, dict[str, Any]]] = []
+    for path in folder.glob(f"{prefix}_*.json"):
+        try:
+            index = int(path.stem.rsplit("_", 1)[-1])
+        except (IndexError, ValueError):
+            continue
+        payload = load_json(path)
+        if isinstance(payload, dict):
+            items.append((index, payload))
+    return [payload for _, payload in sorted(items, key=lambda pair: pair[0])]
+
+
 # ---------------------------------------------------------------------------
 # Сериализация моделей
 # ---------------------------------------------------------------------------
