@@ -113,6 +113,87 @@ jobs:
     assert any("checkout" in problem for problem in problems)
 
 
+def test_unknown_action_input_is_reported(tmp_path):
+    """Вход `with:`, которого у действия нет, останавливает job целиком.
+
+    Именно так проявился `retention-days` у `actions/cache`: у действия
+    такого входа нет, и весь job обучения остановился, не отработав ни
+    одного батча. Обнаружить это можно было только в CI, уже потратив
+    время на ожидание, — поэтому проверка вынесена в валидатор.
+    """
+    text = """
+on: [push]
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        with:
+          path: state.json
+          retention-days: 30
+"""
+    problems = check(write(tmp_path, text))
+    assert any("retention-days" in problem for problem in problems)
+    assert any("actions/cache" in problem for problem in problems)
+
+
+def test_known_action_inputs_are_accepted(tmp_path):
+    """Корректные входа замечанием не считаются."""
+    text = """
+on: [push]
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/upload-artifact@v7
+        with:
+          name: logs
+          path: training.log
+          if-no-files-found: warn
+          retention-days: 30
+"""
+    assert check(write(tmp_path, text)) == []
+
+
+def test_unknown_action_is_not_reported(tmp_path):
+    """Действие, которого нет в таблице, замечанием не считается.
+
+    Иначе добавление любого нового действия требовало бы правки
+    валидатора, и им перестали бы пользоваться.
+    """
+    text = """
+on: [push]
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: some/other-action@v1
+        with:
+          whatever: value
+"""
+    assert check(write(tmp_path, text)) == []
+
+
+def test_cache_steps_have_no_retention_days():
+    """В workflow не должно быть `retention-days` у действий кэша.
+
+    Явная проверка боевого файла: у `actions/cache` и `actions/cache/save`
+    такого входа нет, и его добавление рушит job обучения.
+    """
+    root = Path(__file__).resolve().parent.parent
+    data = yaml.safe_load(
+        (root / ".github" / "workflows" / "main.yml").read_text(encoding="utf-8")
+    )
+    for job in data["jobs"].values():
+        for step in job.get("steps", []):
+            uses = str(step.get("uses", ""))
+            if uses.startswith("actions/cache"):
+                assert "retention-days" not in (step.get("with") or {}), uses
+
+
 def test_job_calling_api_only_needs_no_checkout(tmp_path):
     """Job, который зовёт только API GitHub, checkout не требует.
 

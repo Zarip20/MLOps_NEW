@@ -41,6 +41,62 @@ WORKSPACE_MARKERS = (
     "sh ",
 )
 
+#: Допустимые входы action'ов, используемых в этом workflow.
+#:
+#: Несуществующий вход — не опечатка, а остановка job: GitHub проверяет
+#: `with:` до выполнения шага. Именно так проявился `retention-days` у
+#: `actions/cache` — у него такого входа нет, и весь job обучения
+#: остановился, не отработав ни одного батча.
+#:
+#: Таблица сверялась с `action.yml` перечисленных версий. Она
+#: устаревает при обновлении action'ов; обновить её можно так:
+#:
+#:     curl -s https://raw.githubusercontent.com/actions/cache/v6/action.yml
+#:
+#: Для неизвестных action'ов проверка молчит: отсутствие записи в
+#: таблице не считается ошибкой, иначе добавление любого нового
+#: action'а требовало бы правки здесь.
+ACTION_INPUTS: dict[str, set[str]] = {
+    "actions/checkout": {
+        "repository", "ref", "token", "ssh-key", "path", "clean",
+        "fetch-depth", "lfs", "submodules", "set-safe-directory",
+        "persist-credentials", "sparse-checkout", "sparse-checkout-cone-mode",
+        "fetch-tags", "show-progress", "filter", "ssh-strict",
+        "ssh-known-hosts", "clean-exclude",
+    },
+    "actions/setup-python": {
+        "python-version", "python-version-file", "cache", "architecture",
+        "check-latest", "token", "cache-dependency-path",
+        "update-environment", "allow-prereleases", "freethreaded", "pip-version",
+    },
+    "actions/cache": {
+        "path", "key", "restore-keys", "upload-chunk-size",
+        "enableCrossOsArchive", "fail-on-cache-miss", "lookup-only",
+        "save-always",
+    },
+    "actions/cache/restore": {
+        "path", "key", "restore-keys", "upload-chunk-size",
+        "enableCrossOsArchive", "fail-on-cache-miss", "lookup-only",
+    },
+    "actions/cache/save": {
+        "path", "key", "upload-chunk-size", "enableCrossOsArchive",
+    },
+    "actions/upload-artifact": {
+        "name", "path", "if-no-files-found", "retention-days",
+        "compression-level", "overwrite", "include-hidden-files", "archive",
+    },
+    "actions/upload-pages-artifact": {
+        "name", "path", "retention-days", "include-hidden-files",
+    },
+    "actions/configure-pages": {
+        "static_site_generator", "generator_config_file", "token", "enablement",
+    },
+    "actions/deploy-pages": {
+        "token", "timeout", "error_count", "reporting_interval",
+        "artifact_name", "preview",
+    },
+}
+
 
 def load(path: Path) -> dict[str, Any]:
     """Разобрать workflow. Ключ `on` YAML превращает в True — учитываем это."""
@@ -115,6 +171,39 @@ def check(path: Path) -> list[str]:
                     f"но его шаги работают с файлами проекта"
                 )
 
+        problems.extend(_unknown_inputs(path, name, steps))
+
+    return problems
+
+
+def _unknown_inputs(path: Path, job: str, steps: Any) -> list[str]:
+    """Входы `with:`, которых у action'а нет.
+
+    GitHub проверяет их до выполнения шага и останавливает job целиком,
+    поэтому опечатка стоит дорого: обнаруживается она только в CI, и
+    после того, как потрачено время на ожидание.
+    """
+    problems: list[str] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        uses = str(step.get("uses", ""))
+        base = uses.split("@", 1)[0]
+        allowed = ACTION_INPUTS.get(base)
+        if allowed is None:
+            # Действие не в таблице: проверка молчит, чтобы добавление
+            # нового action'а не требовало правки здесь.
+            continue
+        given = step.get("with") or {}
+        if not isinstance(given, dict):
+            continue
+        for key in given:
+            if str(key) not in allowed:
+                problems.append(
+                    f"{path}: job {job!r}, действие {base}: входа {key!r} "
+                    f"не существует; допустимо: "
+                    f"{', '.join(sorted(allowed))}"
+                )
     return problems
 
 

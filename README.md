@@ -40,7 +40,7 @@ python -m venv .venv
 | `python -m src.collector --describe` | Сводка по каталогу батчей |
 | `python -m src.collector --append F` | Принять новый батч из внешнего файла |
 | `python -m src.publish --out DIR` | Собрать сайт (то же, что `-mode publish`) |
-| `pytest tests -q` | 302 теста |
+| `pytest tests -q` | 306 тестов |
 | `python -m tests.check_workflow .github/workflows/main.yml` | Проверить workflow |
 
 ### Приём данных извне
@@ -135,7 +135,7 @@ Workflow **MLOps CI Pipeline** (`.github/workflows/main.yml`): три job
 │   ├── state.py                 # версионированное состояние прогона
 │   ├── logging_setup.py         # единое логирование в файл и консоль
 │   └── utils.py                 # утилиты: JSON, pickle, даты, память
-├── tests/                       # 302 теста
+├── tests/                       # 306 тестов
 ├── data/                        # батчи, метаданные, правила (генерируются)
 ├── models/                      # модели, препроцессор, сборщик (генерируются)
 ├── reports/                     # отчёты и дашборд (генерируются)

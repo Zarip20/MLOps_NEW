@@ -22,7 +22,7 @@ MLOps-система обработки потоковых табличных д
 - `run.py` — только разбор аргументов; вся логика в `src/pipeline.py`
 - `config.yaml` — единственный источник настроек, проверяется при старте
 - `src/` — модули конвейера (см. дерево в `README.md`)
-- `tests/` — 302 теста, `check_workflow.py` — валидатор workflow
+- `tests/` — 306 тестов, `check_workflow.py` — валидатор workflow
 - `.github/workflows/main.yml` — job `test → train → publish`
 - `doc/` — требования, оценка, `github_actions.md` (инструкция по CI)
 - `PLAN.md` — авторитетная запись хода работы и решений Р-1…Р-6

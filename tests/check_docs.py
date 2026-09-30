@@ -138,7 +138,12 @@ def check_manifest_facts(text: str) -> list[str]:
     """Числа, которые можно сверить с артефактами прогона."""
     metadata = ROOT / "data" / "metadata"
     if not metadata.is_dir():
-        return ["нет каталога data/metadata: сначала выполните `-mode update`"]
+        # Артефактов ещё нет — это не расхождение, а обычное состояние
+        # свежего клона и job `test` в CI, который идёт до обучения.
+        # Проверка обязана такие числа просто пропускать: иначе она
+        # ругалась бы на то, чего ещё не существует, и её перестали бы
+        # читать. О пропуске сказано в выводе.
+        return []
 
     manifests: list[dict] = []
     for path in sorted(metadata.glob("run_manifest_*.json")):
@@ -147,7 +152,7 @@ def check_manifest_facts(text: str) -> list[str]:
         except (OSError, ValueError):
             continue
     if not manifests:
-        return ["нет манифестов прогона"]
+        return []
 
     problems: list[str] = []
     processed = len(manifests)
@@ -197,6 +202,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     problems = check()
+    metadata = ROOT / "data" / "metadata"
+    artifacts = "сверено с артефактами" if (metadata / "run_manifest_0000.json").is_file() \
+        else "артефактов прогона нет — числа сверены только с исходниками"
+
     if problems:
         for item in problems:
             print(f"ОШИБКА {item}")
@@ -207,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(
         f"Документация сходится: тестов {count_tests()}, "
-        f"упомянутые пути существуют, числа согласуются с артефактами"
+        f"упомянутые пути существуют, {artifacts}"
     )
     return 0
 
