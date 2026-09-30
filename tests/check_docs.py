@@ -13,7 +13,13 @@
 
 Запуск:
 
-    python -m tests.check_docs
+    python -m tests.check_docs           # только проверить
+    python -m tests.check_docs --fix     # привести числа к фактическим
+
+Ключ `--fix` нужен потому, что счётчик тестов меняется при каждом
+новом тесте, а упоминаний восемь, и после них ещё и требуется
+правильное склонение: «321 тест», но «322 теста». Вручную это каждый
+раз приходилось бы вспоминать, и ошибка «321 тестов» повторялась.
 """
 
 from __future__ import annotations
@@ -39,18 +45,44 @@ CURRENT_DOCS = [
     "doc/github_actions.md",
 ]
 
-#: Формулировки, которыми в разных файлах называется ВСЕГО тестов.
-#: По одной формулировке ищутся числа, по другой — не ищется ничего:
-#: «в файле test_collector.py 18 тестов» это не итог, и сравнивать его
-#: с общим числом бессмысленно.
-TOTAL_PATTERNS = (
-    r"(\d{2,4})\s+тест(?:а|ов)?\s*\|",              # README: строка таблицы
-    r"#\s*(\d{2,4})\s+тест",                          # github_actions: комментарий
-    r"tests/\s*\((\d{2,4})\s+тест",                   # github_actions: таблица
-    r"`pytest tests -q`\s*\|\s*(\d{2,4})\s+тест",      # README: команда
-    r"тестов:\s*(\d{2,4})",                           # grade: раздел проверки
-    r"(\d{2,4})\s+тест(?:а|ов)?[,\.]?\s*$",            # хвост строки
-)
+#: Любое упоминание количества тестов, а не только «красивые» формулировки.
+#:
+#: Первая версия проверяла по белому списку шаблонов («… тестов |»,
+#: «# … тестов», «tests/ (… тестов)»). Список оказался дырявым: из
+#: восьми реальных упоминаний итогового числа он узнавал пять, и
+#: устаревшее число в трёх местах проходило молча — ровно то, ради чего
+#: проверка и написана.
+#:
+#: Поэтому берутся **все** вхождения подряд, а исключаются два явно
+#: отмеченных случая — см. `_is_per_file_count`.
+COUNT_PATTERN = re.compile(r"\b(\d+)\s+тест\w*")
+
+
+def _is_per_file_count(line: str, match: re.Match[str]) -> bool:
+    """Упоминание количества тестов **одного файла**, а не всего набора.
+
+    Различаются два случая, и оба встречаются в документации:
+
+    * инструментальный падеж — «закрыто 14 тестами». Всегда про один
+      файл: «закрыть 306 тестами» не имеет смысла, а «закрыто 306
+      тестов» — имеет;
+    * рядом стоит имя файла в кавычках — «| `test_meta.py` | 21
+      тестов |».
+
+    Всё остальное считается итогом. Ложное срабатывание неприятно, но
+    оно заметно и исправляется за минуту, а ложное **пропускание**
+    незаметно: устаревшее число годами выглядит как актуальное.
+    """
+    word = match.group(0).split(" ", 1)[1]
+    if word.startswith("тестами") or word.startswith("тестах"):
+        return True
+
+    before = line[: match.start()]
+    # Имя файла в кавычках, отделённое от числа только знаком таблицы.
+    tail = before.rsplit("`", 2)
+    if len(tail) >= 2 and re.search(r"\.py`?\s*\|?\s*$", tail[-2]):
+        return True
+    return False
 
 
 def count_tests() -> int:
@@ -106,19 +138,65 @@ def docs_text() -> str:
     return "\n".join((ROOT / name).read_text(encoding="utf-8") for name in CURRENT_DOCS)
 
 
-def check_test_count(text: str) -> list[str]:
-    """Все названные итоговые числа должны совпадать между собой."""
-    found = {
-        int(value)
-        for pattern in TOTAL_PATTERNS
-        for value in re.findall(pattern, text)
-    }
+def _stated_counts() -> dict[int, list[str]]:
+    """Итоговые числа тестов, где они упомянуты: число → список мест.
+
+    Места возвращаются как `файл:строка`, потому что замечание «в тексте
+    302, в тестах 306» требуло искать по всему проекту. С указанием
+    строки правка занимает секунду.
+    """
+    found: dict[int, list[str]] = {}
+    for name in CURRENT_DOCS:
+        path = ROOT / name
+        for number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), 1
+        ):
+            for match in COUNT_PATTERN.finditer(line):
+                if _is_per_file_count(line, match):
+                    continue
+                found.setdefault(int(match.group(1)), []).append(
+                    f"{name}:{number}"
+                )
+    return found
+
+
+def correct_form(number: int) -> str:
+    """Правильная форма существительного после числительного.
+
+    «321 тест», но «322 теста» и «325 тестов». Ошибка тут не в числах,
+    а в грамматике, и она повторяется каждый раз при обновлении
+    счётчика, — поэтому форма вычисляется, а не набирается вручную.
+    """
+    tail_hundreds, tail = number % 100, number % 10
+    if 11 <= tail_hundreds <= 14:
+        return "тестов"
+    if tail == 1:
+        return "тест"
+    if 2 <= tail <= 4:
+        return "теста"
+    return "тестов"
+
+
+def check_test_count() -> list[str]:
+    """Все названные итоговые числа должны совпадать с фактическим."""
+    found = _stated_counts()
     actual = count_tests()
     if not found:
         return ["в документации не найдено ни одного итогового числа тестов"]
-    return [
-        f"итоговое число тестов: в тексте {sorted(found)}, в tests/ — {actual}"
-    ] if found != {actual} else []
+
+    problems: list[str] = []
+    for value in sorted(found):
+        if value == actual:
+            continue
+        places = found[value]
+        shown = ", ".join(places[:8])
+        if len(places) > 8:
+            shown += f" и ещё {len(places) - 8}"
+        problems.append(
+            f"указано «{value} тестов», а на самом деле {actual} "
+            f"({actual} {correct_form(actual)}); исправить в {shown}"
+        )
+    return problems
 
 
 def check_referenced_files(text: str) -> list[str]:
@@ -146,15 +224,27 @@ def check_manifest_facts(text: str) -> list[str]:
         return []
 
     manifests: list[dict] = []
+    unreadable: list[str] = []
     for path in sorted(metadata.glob("run_manifest_*.json")):
         try:
-            manifests.append(json.loads(path.read_text(encoding="utf-8")))
-        except (OSError, ValueError):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            unreadable.append(f"{path.name} ({error})")
             continue
-    if not manifests:
-        return []
+        if isinstance(payload, dict):
+            manifests.append(payload)
 
     problems: list[str] = []
+    if unreadable:
+        # Битый манифест пропускается молча — из-за него одного
+        # теряется весь разбор истории. Сообщение называет файлы.
+        problems.append(
+            f"не читаются манифесты: {', '.join(unreadable[:5])}"
+        )
+
+    if not manifests:
+        return problems
+
     processed = len(manifests)
     if processed == 48:
         for match in sorted(set(re.findall(r"(\d+)\s+из\s+48", text))):
@@ -165,7 +255,9 @@ def check_manifest_facts(text: str) -> list[str]:
                 )
     else:
         problems.append(
-            f"манифестов {processed}, а документация описывает прогон 48 батчей"
+            f"прочитано манифестов {processed} из "
+            f"{len(manifests) + len(unreadable)}, а документация описывает "
+            f"прогон 48 батчей"
         )
 
     widths = {
@@ -189,17 +281,79 @@ def check_manifest_facts(text: str) -> list[str]:
 def check() -> list[str]:
     text = docs_text()
     return (
-        check_test_count(text)
+        check_test_count()
         + check_referenced_files(text)
         + check_manifest_facts(text)
     )
 
 
+def fix_totals() -> list[str]:
+    """Привести упоминания итогового числа к фактическому.
+
+    Счётчик меняется при каждом новом тесте, а упоминаний восемь, и
+    правильное склонение после них («321 тест», но «322 теста») при
+   ходится ещё и вычислять. Оба действия выполняются здесь, потому
+    что иначе ошибка повторяется каждый раз.
+
+    Числа тестов **отдельных файлов** не трогаются: они не итоговые,
+    и «18 тестов» про один файл — правильное утверждение.
+
+    Returns:
+        Список исправленных мест `файл:строка`.
+    """
+    actual = count_tests()
+    replacement = f"{actual} {correct_form(actual)}"
+    fixed: list[str] = []
+
+    for name in CURRENT_DOCS:
+        path = ROOT / name
+        lines = path.read_text(encoding="utf-8").splitlines()
+        changed = False
+
+        for index, line in enumerate(lines):
+            edits = [
+                (match.start(), match.end(), replacement)
+                for match in COUNT_PATTERN.finditer(line)
+                if not _is_per_file_count(line, match)
+            ]
+            if not edits:
+                continue
+            for start, end, text in reversed(edits):
+                line = line[:start] + text + line[end:]
+            # Совпадение после замены означает, что число уже верное.
+            # Без этой проверки `--fix` переписывал бы файлы при каждом
+            # запуске, создавая изменения там, где их нет.
+            if line == lines[index]:
+                continue
+            lines[index] = line
+            fixed.append(f"{name}:{index + 1}")
+            changed = True
+
+        if changed:
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    return fixed
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = list(argv if argv is not None else sys.argv[1:])
-    if arguments:
-        print("Проверка принимает пустой список аргументов или ни одного")
+
+    if any(item != "--fix" for item in arguments):
+        print(
+            "Проверка принимает ключ --fix (привести числа к фактическим) "
+            "или не принимает ничего вовсе"
+        )
         return 2
+
+    if "--fix" in arguments:
+        fixed = fix_totals()
+        if not fixed:
+            print("Итоговые числа в документации уже верны")
+        else:
+            print(f"Исправлено мест: {len(fixed)}")
+            for place in fixed:
+                print(f"  {place}")
+            print("Проверьте повторным запуском без --fix")
 
     problems = check()
     metadata = ROOT / "data" / "metadata"

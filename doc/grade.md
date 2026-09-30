@@ -163,7 +163,7 @@
 # Проверка
 
 ```powershell
-python -m pytest tests -q                          # 302 теста
+python -m pytest tests -q                          # 342 теста
 python -m tests.check_workflow .github/workflows/main.yml
 python run.py -mode init -reset
 python run.py -mode update -n 48
